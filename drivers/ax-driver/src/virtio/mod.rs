@@ -1,6 +1,11 @@
-use core::{marker::PhantomData, ptr::NonNull};
+use core::{
+    marker::PhantomData,
+    ptr::NonNull,
+    sync::atomic::{AtomicPtr, Ordering},
+};
 
 use ax_alloc::{UsageKind, global_allocator};
+use ax_memory_addr::PAGE_SIZE_4K;
 #[cfg(feature = "virtio-net")]
 use virtio_drivers::Error as VirtIoError;
 use virtio_drivers::{
@@ -66,6 +71,223 @@ pub const fn has_static_mmio_drivers() -> bool {
     ))
 }
 
+/// Device-visible staging for virtio buffers that live outside the linear DMA
+/// window.
+///
+/// `Hal::share` must return an address the device can actually read. Kernel
+/// virtual addresses are only a linear offset of their physical frames inside
+/// the linear map window; task stacks (vmap'd, physically scattered) and other
+/// dynamic mappings break that identity, so a formula-based translation would
+/// silently hand the device the wrong frames. [`share`](VirtIoHal::share)
+/// therefore translates through the kernel page tables and shares zero-copy
+/// whenever the buffer is physically contiguous; scattered buffers are copied
+/// into staging memory owned by this driver:
+///
+/// * a pool of fixed slots for buffers up to [`BOUNCE_SLOT_SIZE`], and
+/// * dedicated tracked pages ([`BOUNCE_OVERSIZE`]) for larger buffers and as
+///   the backstop when the pool has no free slot.
+///
+/// `unshare` copies device-written responses back into the caller's original
+/// buffer and recycles the staging memory. Staging never falls back to the
+/// offset formula: `Hal::share` cannot report failure, and handing the device
+/// an unverified address would corrupt memory, so a staging allocation
+/// failure panics.
+///
+/// This mirrors Linux's `dma_map_single` + swiotlb bounce design: drivers keep
+/// their zero-copy submission model; the mapping layer owns addressability.
+/// Two platform assumptions apply, both shared with the pre-existing
+/// `dma_alloc` path: the device is coherent (no cache maintenance around the
+/// staging copies), and kernel frames are [`PAGE_SIZE_4K`]. A platform whose
+/// [`Klib`](axklib::Klib) exposes no page-table query reports `None` for every
+/// translation, so every borrowed buffer is staged — one copy is the price of
+/// not guessing.
+const BOUNCE_SLOT_SIZE: usize = 16 * 1024;
+const BOUNCE_POOL_SLOTS: usize = 64;
+
+struct BouncePool {
+    /// Linear-window virtual base of the pool.
+    vaddr: usize,
+    /// Physical base handed to the device.
+    paddr: usize,
+    /// Free slot ids.
+    free: ax_sync::SpinLock<alloc::vec::Vec<u32>>,
+}
+
+/// Initialized pool handle, `null` until the first scattered buffer needs
+/// staging. `Release`/`Acquire` publish the fully constructed pool; `unshare`
+/// loads it read-only so completing direct-mapped descriptors never
+/// initializes or locks anything.
+static BOUNCE_POOL: AtomicPtr<BouncePool> = AtomicPtr::new(core::ptr::null_mut());
+/// Oversize staging: device paddr → (staging vaddr, staged length).
+static BOUNCE_OVERSIZE: ax_sync::SpinLock<alloc::collections::BTreeMap<usize, (usize, usize)>> =
+    ax_sync::SpinLock::new(alloc::collections::BTreeMap::new());
+
+/// Returns the initialized pool without ever creating one (for `unshare`).
+fn bounce_pool_ready() -> Option<&'static BouncePool> {
+    let pool = BOUNCE_POOL.load(Ordering::Acquire);
+    (!pool.is_null()).then(|| unsafe { &*pool })
+}
+
+/// Returns the pool, initializing it on first use. Returns `None` when the
+/// pool allocation fails; callers stage per-buffer instead. Unlike a permanent
+/// failed state this can be retried — a failed boot-time allocation must not
+/// disable staging for the lifetime of the kernel.
+fn bounce_pool_init() -> Option<&'static BouncePool> {
+    if let Some(pool) = bounce_pool_ready() {
+        return Some(pool);
+    }
+    let total_pages = (BOUNCE_SLOT_SIZE * BOUNCE_POOL_SLOTS).div_ceil(PAGE_SIZE_4K);
+    let Ok(vaddr) = global_allocator().alloc_pages(total_pages, PAGE_SIZE_4K, UsageKind::Dma)
+    else {
+        log::debug!("virtio: bounce pool allocation failed; staging per buffer");
+        return None;
+    };
+    let pool = alloc::boxed::Box::new(BouncePool {
+        vaddr,
+        paddr: axklib::mem::virt_to_phys(vaddr.into()).as_usize(),
+        free: ax_sync::SpinLock::new((0..BOUNCE_POOL_SLOTS as u32).rev().collect()),
+    });
+    let pool = alloc::boxed::Box::into_raw(pool);
+    match BOUNCE_POOL.compare_exchange(
+        core::ptr::null_mut(),
+        pool,
+        Ordering::Release,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Some(unsafe { &*pool }),
+        Err(winner) => {
+            // Lost the one-shot init race; the winner's pool serves everyone.
+            let losing = unsafe { alloc::boxed::Box::from_raw(pool) };
+            global_allocator().dealloc_pages(losing.vaddr, total_pages, UsageKind::Dma);
+            drop(losing);
+            Some(unsafe { &*winner })
+        }
+    }
+}
+
+mod direct_map;
+
+/// Walks `vaddr..vaddr + len` through the kernel page tables and returns the
+/// buffer's physical base when it can be direct-mapped (all pages
+/// translatable, physically contiguous); `None` otherwise.
+fn contiguous_dma_paddr(vaddr: usize, len: usize) -> Option<usize> {
+    direct_map::contiguous_dma_paddr_with(axklib::mem::virt_to_phys_checked, vaddr, len)
+}
+
+/// Copies caller data into staging memory. `DriverToDevice`/`Both` copy the
+/// bytes in; `DeviceToDriver` zeroes the staging first so an under-writing
+/// device cannot leak a previous stager's bytes back through `unshare`.
+///
+/// # Safety
+///
+/// `dst` must be valid for `buffer.len()` bytes and must not overlap the
+/// caller's buffer.
+unsafe fn stage_into(dst: *mut u8, buffer: NonNull<[u8]>, direction: BufferDirection) {
+    let len = buffer.len();
+    let src = buffer.as_ptr() as *mut u8;
+    // SAFETY: the caller's buffer and the staging memory are valid for `len`
+    // bytes and do not overlap.
+    unsafe {
+        match direction {
+            BufferDirection::DriverToDevice | BufferDirection::Both => {
+                core::ptr::copy_nonoverlapping(src, dst, len);
+            }
+            BufferDirection::DeviceToDriver => core::ptr::write_bytes(dst, 0, len),
+        }
+    }
+}
+
+/// Stages `buffer` into a free pool slot. Returns the device-visible paddr,
+/// or `None` when the pool has no free slot (the caller stages fresh pages).
+///
+/// # Safety
+///
+/// See [`stage_into`]; the pool slot satisfies it for any buffer up to
+/// [`BOUNCE_SLOT_SIZE`].
+unsafe fn bounce_stage(
+    pool: &BouncePool,
+    buffer: NonNull<[u8]>,
+    direction: BufferDirection,
+) -> Option<usize> {
+    let slot = pool.free.lock().pop()?;
+    let off = slot as usize * BOUNCE_SLOT_SIZE;
+    // SAFETY: pool-owned linear-window memory, disjoint from the caller's
+    // buffer.
+    unsafe { stage_into((pool.vaddr + off) as *mut u8, buffer, direction) };
+    Some(pool.paddr + off)
+}
+
+/// Stages `buffer` into dedicated linear-window pages tracked in
+/// [`BOUNCE_OVERSIZE`]. Serves buffers larger than a pool slot and backs up an
+/// exhausted pool. Returns the device-visible paddr, or `None` when the
+/// allocation fails.
+///
+/// # Safety
+///
+/// See [`stage_into`]; the fresh allocation satisfies it.
+unsafe fn fresh_stage(buffer: NonNull<[u8]>, direction: BufferDirection) -> Option<usize> {
+    let len = buffer.len();
+    let pages = len.div_ceil(PAGE_SIZE_4K);
+    let Ok(dst) = global_allocator().alloc_pages(pages, PAGE_SIZE_4K, UsageKind::Dma) else {
+        return None;
+    };
+    let paddr = axklib::mem::virt_to_phys(dst.into()).as_usize();
+    // SAFETY: freshly allocated linear-window pages, disjoint from the
+    // caller's buffer.
+    unsafe { stage_into(dst as *mut u8, buffer, direction) };
+    BOUNCE_OVERSIZE.lock().insert(paddr, (dst, len));
+    Some(paddr)
+}
+
+/// Copies device-written data back into the caller's original buffer and
+/// recycles the staging memory. Addresses outside the staging range belong to
+/// direct-mapped buffers, which were never copied and need no work.
+///
+/// # Safety
+///
+/// `paddr` must be the address [`bounce_stage`] or [`fresh_stage`] returned
+/// for `buffer`, and the staging memory must not overlap the caller's buffer.
+unsafe fn bounce_unstage(
+    pool: &BouncePool,
+    paddr: usize,
+    buffer: NonNull<[u8]>,
+    direction: BufferDirection,
+) {
+    let len = buffer.len();
+    let dst = buffer.as_ptr() as *mut u8;
+
+    if paddr >= pool.paddr && paddr < pool.paddr + BOUNCE_SLOT_SIZE * BOUNCE_POOL_SLOTS {
+        let off = paddr - pool.paddr;
+        debug_assert_eq!(off % BOUNCE_SLOT_SIZE, 0);
+        if matches!(
+            direction,
+            BufferDirection::DeviceToDriver | BufferDirection::Both
+        ) {
+            // SAFETY: the pool slot and the caller's buffer are valid for
+            // `len` bytes and do not overlap.
+            unsafe { core::ptr::copy_nonoverlapping((pool.vaddr + off) as *const u8, dst, len) };
+        }
+        pool.free.lock().push((off / BOUNCE_SLOT_SIZE) as u32);
+        return;
+    }
+    if let Some((vaddr, staged_len)) = BOUNCE_OVERSIZE.lock().remove(&paddr) {
+        debug_assert_eq!(staged_len, len);
+        // Clamp so a length-contract violation cannot read past the staging
+        // allocation in release builds; the deallocation always covers the
+        // full staged allocation.
+        let copy_len = staged_len.min(len);
+        if matches!(
+            direction,
+            BufferDirection::DeviceToDriver | BufferDirection::Both
+        ) {
+            // SAFETY: the staging pages and the caller's buffer are valid for
+            // `copy_len` bytes and do not overlap.
+            unsafe { core::ptr::copy_nonoverlapping(vaddr as *const u8, dst, copy_len) };
+        }
+        global_allocator().dealloc_pages(vaddr, staged_len.div_ceil(PAGE_SIZE_4K), UsageKind::Dma);
+    }
+}
+
 unsafe impl VirtIoHal for VirtIoHalImpl {
     fn dma_alloc(
         pages: usize,
@@ -101,19 +323,46 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
 
     unsafe fn share(
         buffer: NonNull<[u8]>,
-        _direction: BufferDirection,
+        direction: BufferDirection,
         _access_platform: bool,
     ) -> VirtIoPhysAddr {
         let vaddr = buffer.as_ptr() as *mut u8 as usize;
-        axklib::mem::virt_to_phys(vaddr.into()).as_usize() as VirtIoPhysAddr
+        // Direct path: buffers whose pages are physically contiguous are
+        // shared zero-copy at their true physical address (no staging, no
+        // copy). The page-table query replaces the linear-offset formula,
+        // which silently mistranslates vmap-window addresses.
+        if let Some(paddr) = contiguous_dma_paddr(vaddr, buffer.len()) {
+            return paddr as VirtIoPhysAddr;
+        }
+        // Scattered (e.g. vmap'd task stacks): a pool slot first, dedicated
+        // pages as the backstop. There is deliberately no formula fallback:
+        // `Hal::share` cannot report failure, and handing the device an
+        // unverified address would silently corrupt kernel memory.
+        let staged = unsafe {
+            bounce_pool_init()
+                .and_then(|pool| bounce_stage(pool, buffer, direction))
+                .or_else(|| fresh_stage(buffer, direction))
+        };
+        match staged {
+            Some(paddr) => paddr as VirtIoPhysAddr,
+            None => panic!(
+                "virtio: cannot DMA-map borrowed buffer at {vaddr:#x}: staging allocation failed \
+                 and an unverified device address would corrupt memory"
+            ),
+        }
     }
 
     unsafe fn unshare(
-        _paddr: VirtIoPhysAddr,
-        _buffer: NonNull<[u8]>,
-        _direction: BufferDirection,
+        paddr: VirtIoPhysAddr,
+        buffer: NonNull<[u8]>,
+        direction: BufferDirection,
         _access_platform: bool,
     ) {
+        // Read-only load: never initializes the pool, so completing a queue
+        // full of direct-mapped descriptors never allocates or locks.
+        if let Some(pool) = bounce_pool_ready() {
+            unsafe { bounce_unstage(pool, paddr as usize, buffer, direction) };
+        }
     }
 }
 

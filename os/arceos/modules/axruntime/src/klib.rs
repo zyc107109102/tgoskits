@@ -162,6 +162,21 @@ impl_trait! {
             ax_hal::mem::virt_to_phys(addr)
         }
 
+        fn mem_virt_to_phys_checked(addr: VirtAddr) -> Option<PhysAddr> {
+            #[cfg(feature = "paging")]
+            {
+                // `try_lock`: a contended address space (or one not yet
+                // initialized) simply reports "unknown"; callers bounce.
+                let guard = ax_mm::kernel_aspace().try_lock()?;
+                guard.query_paddr(addr).ok()
+            }
+            #[cfg(not(feature = "paging"))]
+            {
+                let _ = addr;
+                None
+            }
+        }
+
         fn dma_cache_clean(addr: VirtAddr, size: usize) {
             dma_cache_range(ax_hal::mem::DCacheOp::Clean, addr, size);
         }

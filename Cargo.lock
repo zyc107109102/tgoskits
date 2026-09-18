@@ -879,10 +879,10 @@ version = "0.16.0"
 dependencies = [
  "ahci-driver",
  "aic8800",
- "anyhow",
  "arm-scmi-rs",
  "ax-alloc",
  "ax-arm-pl031",
+ "ax-memory-addr",
  "ax-sync",
  "axklib",
  "bitflags 2.13.2",

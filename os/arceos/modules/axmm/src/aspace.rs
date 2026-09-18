@@ -99,6 +99,17 @@ impl AddrSpace {
             .map_err(|_| MmError::BadAddress)
     }
 
+    /// Returns the physical address currently backing `vaddr`, if the page is
+    /// materialized in this address space.
+    ///
+    /// Consumers that must hand device-visible addresses to DMA-capable
+    /// hardware use this instead of offset-based translations, which are only
+    /// valid inside the linear map window.
+    pub fn query_paddr(&self, vaddr: VirtAddr) -> MmResult<PhysAddr> {
+        let (paddr, ..) = self.pt.query(vaddr).map_err(|_| MmError::BadAddress)?;
+        Ok(paddr)
+    }
+
     /// Returns flags and leaf size without exposing page-table ownership.
     pub fn mapping_attributes(&self, vaddr: VirtAddr) -> MmResult<(MappingFlags, usize)> {
         self.pt

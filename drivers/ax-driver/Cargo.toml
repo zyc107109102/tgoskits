@@ -24,7 +24,7 @@ vsock = ["dep:rdif-vsock"]
 rtc = []
 pinctrl = ["dep:rdif-pinctrl", "rdif-pinctrl/fdt"]
 
-virtio-core = ["dep:ax-alloc", "dep:virtio-drivers", "virtio-drivers/alloc"]
+virtio-core = ["dep:ax-alloc", "dep:ax-sync", "dep:virtio-drivers", "virtio-drivers/alloc"]
 virtio = ["virtio-core"]
 virtio-net = ["net", "virtio", "pci", "dep:ax-sync"]
 virtio-gpu = ["display", "virtio", "pci"]
@@ -147,9 +147,9 @@ pci-list-devices = ["list-pci-devices"]
 [dependencies]
 aic8800 = { workspace = true, optional = true }
 ahci-driver = { workspace = true, optional = true }
-anyhow = { workspace = true }
 arm-scmi-rs = { workspace = true, optional = true }
 ax-alloc = { workspace = true, optional = true }
+ax-memory-addr = { workspace = true }
 ax-sync = { workspace = true, optional = true }
 axklib.workspace = true
 bitflags = { workspace = true, optional = true }
