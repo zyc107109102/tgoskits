@@ -268,9 +268,16 @@ impl DmaOp for KlibDma {
     ) -> Result<DmaMapHandle, DmaError> {
         let align = constraints.align.max(1);
         let layout = Layout::from_size_align(size.get(), align)?;
-        let dma_addr = dma_addr_from_ptr(addr);
+        // Device-visible addresses come from verified page-table
+        // translations. The offset formula only holds inside the linear map
+        // window; vmap'd buffers (task stacks, dynamic aliases) silently
+        // break it. An unknown translation bounces instead of guessing.
+        let direct =
+            crate::klib::mem_virt_to_phys_checked(VirtAddr::from_usize(addr.as_ptr() as usize))
+                .map(|pa| pa.as_usize() as u64)
+                .filter(|&dma_addr| dma_mapping_can_be_direct(dma_addr, size.get(), constraints));
 
-        if dma_mapping_can_be_direct(dma_addr, size.get(), constraints) {
+        if let Some(dma_addr) = direct {
             return Ok(unsafe { DmaMapHandle::new(addr, dma_addr.into(), layout, None) });
         }
 
