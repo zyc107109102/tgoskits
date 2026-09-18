@@ -43,6 +43,26 @@ const BUF_SIZE: usize = 64 * 1024;
 /// pollers. StarryOS `do_poll` measures wake-to-return latency against this.
 pub static LAST_PEER_WAKE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// [wake-hop] publish+wake invocation cost histogram edges (µs).
+const WAKE_PUB_EDGES_US: [u64; 10] = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000];
+/// [wake-hop] sender-side cost of `PollSet::wake` including waker dispatch.
+pub static WAKE_PUB_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WAKE_PUB_SUM_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WAKE_PUB_MAX_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static WAKE_PUB_BUCKETS: [core::sync::atomic::AtomicU64; 11] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
 /// One pending cmsg batch carried across a Unix stream socketpair.
 ///
 /// `start_byte` is the 1-based cumulative tx-byte offset of the first
@@ -448,7 +468,24 @@ impl TransportOps for StreamTransport {
         drop(guard);
         if let Some(poll) = wake_poll {
             // Peer-visible bytes and cmsg state are published before wake.
+            // [wake-hop] sender-side publish+wake invocation cost (PollSet
+            // lock + waker dispatch + ready-inbox publication).
+            let pub_t0_ns = ax_hal::time::monotonic_time_nanos() as u64;
             unsafe { poll.wake(IoEvents::IN) };
+            let pub_t1_ns = ax_hal::time::monotonic_time_nanos() as u64;
+            {
+                use core::sync::atomic::Ordering;
+                let cost = pub_t1_ns - pub_t0_ns;
+                WAKE_PUB_N.fetch_add(1, Ordering::Relaxed);
+                WAKE_PUB_SUM_NS.fetch_add(cost, Ordering::Relaxed);
+                WAKE_PUB_MAX_NS.fetch_max(cost, Ordering::Relaxed);
+                let mut idx = 0;
+                let us = cost / 1000;
+                while idx < WAKE_PUB_EDGES_US.len() && us >= WAKE_PUB_EDGES_US[idx] {
+                    idx += 1;
+                }
+                WAKE_PUB_BUCKETS[idx].fetch_add(1, Ordering::Relaxed);
+            }
             // [run6g] poll-wakeup-latency forensics: the receiver's blocked
             // ppoll should return within µs of this wake.
             LAST_PEER_WAKE_NS.store(

@@ -261,6 +261,9 @@ unsafe fn schedule_with_intent(header: *mut CoroutineHeader, intent: WakeIntent)
         }
     }
 
+    // [wake-hop] stage 1: this caller won the enqueue; duplicates were
+    // coalesced by the RUN_QUEUED check above.
+    crate::probe::record_wake_enq(header_ref.owner_thread().as_u64());
     retain_reference(header_ref);
     if !header_ref.executor.publish_ready(header, intent) {
         header_ref.state.fetch_and(!RUN_QUEUED, Ordering::AcqRel);

@@ -63,6 +63,13 @@ impl LocalExecutor {
 
         state.fetch_or(POLLING, Ordering::AcqRel);
         queue_reference.mark_polling();
+        // [wake-hop] stage 4: pick attribution and stage 5 non-yielding poll
+        // duration, both keyed to this exact coroutine.
+        crate::probe::record_pick(unsafe {
+            // The queue reference guarantees a valid header for the pick probe.
+            (*header).owner_thread().as_u64()
+        });
+        let probe_poll_start_ns = crate::probe::now_ns();
         let waker = unsafe {
             // `header` remains pinned and the queue reference outlives the Waker.
             coroutine_waker(header)
@@ -73,6 +80,7 @@ impl LocalExecutor {
             // owner poll of the same future.
             CoroutineHeader::poll_raw(header, &mut context)
         };
+        crate::probe::record_poll_duration(crate::probe::now_ns() - probe_poll_start_ns);
         drop(waker);
         queue_reference.finish_polling();
 

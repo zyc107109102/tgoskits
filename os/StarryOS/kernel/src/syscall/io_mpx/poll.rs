@@ -167,6 +167,10 @@ fn do_poll(
         // the wakeup+return path cost (waker -> scheduler -> re-poll -> syscall
         // return). Only counted when this poll actually waited (registered a
         // waker); an instantly-ready poll's delta is meaningless.
+        //
+        // [wake-hop run5] the return cause is sampled separately: a timeout
+        // return (Ok(0)) carries a stale peer-wake timestamp, so lumping it
+        // into the wakeup-driven distribution fabricates delivery latency.
         if did_wait.get() && out.is_ok() {
             let now_ns = ax_runtime::hal::time::monotonic_time_nanos() as u64;
             let last_wake = crate::syscall::net::unix_stream_last_peer_wake_ns();
@@ -179,8 +183,32 @@ fn do_poll(
                 x if x < 4000 => 4,
                 _ => 5,
             };
+            let woke_with_events = matches!(&out, Ok(n) if *n > 0);
+            let target: &AtomicU64 = if woke_with_events {
+                &POLL_WAKE_READY[idx]
+            } else {
+                &POLL_WAKE_TIMEOUT[idx]
+            };
+            target.fetch_add(1, Ordering::Relaxed);
             POLL_WAKE_LAT[idx].fetch_add(1, Ordering::Relaxed);
             POLL_WAKE_LAT_CNT.fetch_add(1, Ordering::Relaxed);
+            // [wake-hop] pick-to-return tail: from the executor's last
+            // ready-inbox dequeue to this syscall return. Counted only when
+            // the last pick belonged to this thread, so the sample is this
+            // poll's own resumption path.
+            use ax_runtime::task::probe;
+            let last_pick = probe::LAST_PICK_NS.load(Ordering::Relaxed);
+            if last_pick != 0
+                && now_ns >= last_pick
+                && probe::LAST_PICK_VICTIM.load(Ordering::Relaxed)
+                    == current.wake_handle().thread_id().as_u64()
+            {
+                let d_us = (now_ns - last_pick) / 1000;
+                let idx = probe::bucket_index_us(now_ns - last_pick, &probe::DELAY_EDGES);
+                PICK2RET[idx].fetch_add(1, Ordering::Relaxed);
+                PICK2RET_SUM_US.fetch_add(d_us, Ordering::Relaxed);
+                PICK2RET_CNT.fetch_add(1, Ordering::Relaxed);
+            }
         }
         out
     })
@@ -197,6 +225,36 @@ pub static POLL_WAKE_LAT: [AtomicU64; 6] = [
     AtomicU64::new(0),
 ];
 pub static POLL_WAKE_LAT_CNT: AtomicU64 = AtomicU64::new(0);
+
+/// [wake-hop run5] return-cause split of POLL_WAKE_LAT: `POLL_WAKE_READY`
+/// counts returns that delivered events (wake-driven), `POLL_WAKE_TIMEOUT`
+/// counts zero-result returns whose peer-wake timestamp is stale.
+pub static POLL_WAKE_READY: [AtomicU64; 6] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+pub static POLL_WAKE_TIMEOUT: [AtomicU64; 6] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// [wake-hop] last-pick-to-syscall-return tail (µs), bucketed on the ax-task
+/// probe DELAY_EDGES. Read/reset by the card0 fx report.
+pub static PICK2RET: [AtomicU64; 11] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    [ZERO; 11]
+};
+pub static PICK2RET_CNT: AtomicU64 = AtomicU64::new(0);
+pub static PICK2RET_SUM_US: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_poll(

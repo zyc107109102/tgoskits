@@ -84,6 +84,9 @@ pub struct SyncFile {
     /// [`Drop`]. A polled fd keeps the refresher at the active cadence until
     /// its fd closes — for per-submit fence fds that is one frame.
     has_poller: AtomicBool,
+    /// [wake-hop run6] monotonic ns when `register()` installed this fence
+    /// (creation of the guest-visible fence latency interval).
+    registered_ns: core::sync::atomic::AtomicU64,
 }
 
 /// Live out-fence registry. The host completion of a fence is only observable
@@ -118,6 +121,18 @@ static REFRESHER_WAKE: WaitQueue = WaitQueue::new();
 /// timeout a guest tolerates, and 20 wakes/s do not contend for the scheduler.
 const REFRESHER_IDLE_TICK: Duration = Duration::from_millis(50);
 
+/// [wake-hop run6] out-fence latency forensics: register() → signal() in ns.
+/// Bucket edges (µs): 10/25/50/100/250/500/1m/2m/4m/8m + overflow.
+pub const FENCE_LAT_EDGES_US: [u64; 10] = [10, 25, 50, 100, 250, 500, 1000, 2000, 4000, 8000];
+pub static FENCE_LAT_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FENCE_LAT_SUM_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FENCE_LAT_MAX_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FENCE_LAT_BUCKETS: [core::sync::atomic::AtomicU64; 11] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    [ZERO; 11]
+};
+
 impl SyncFile {
     /// Creates a sync_file for `fence_id`, initially unsignaled.
     pub fn new(fence_id: u64) -> Self {
@@ -126,6 +141,7 @@ impl SyncFile {
             signaled: AtomicBool::new(false),
             poll_set: PollSet::new(),
             has_poller: AtomicBool::new(false),
+            registered_ns: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -136,6 +152,10 @@ impl SyncFile {
     /// registry is never held with IRQs enabled, so the completion IRQ can
     /// never spin on it.
     pub fn register(self: &Arc<Self>) {
+        self.registered_ns.store(
+            monotonic_time().as_nanos() as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         FENCE_WAITERS
             .lock()
             .push((self.fence_id, Arc::downgrade(self)));
@@ -148,6 +168,26 @@ impl SyncFile {
     /// call sites (WAIT ioctl, poll levels, in-fence waits) are task context.
     fn signal(&self) {
         if !self.signaled.swap(true, Ordering::Release) {
+            // [wake-hop run6] fence latency: register() → signal() covers
+            // host processing + the refresher cadence that actually notices
+            // the completion. This is the guest-visible out-fence latency
+            // Mesa's sync_file poll experiences.
+            let registered = self.registered_ns.load(Ordering::Relaxed);
+            if registered != 0 {
+                let now = monotonic_time().as_nanos() as u64;
+                if now >= registered {
+                    let dt = now - registered;
+                    FENCE_LAT_SUM_NS.fetch_add(dt, Ordering::Relaxed);
+                    FENCE_LAT_MAX_NS.fetch_max(dt, Ordering::Relaxed);
+                    FENCE_LAT_N.fetch_add(1, Ordering::Relaxed);
+                    let mut idx = 0usize;
+                    let us = dt / 1000;
+                    while idx < FENCE_LAT_EDGES_US.len() && us >= FENCE_LAT_EDGES_US[idx] {
+                        idx += 1;
+                    }
+                    FENCE_LAT_BUCKETS[idx].fetch_add(1, Ordering::Relaxed);
+                }
+            }
             // SAFETY: task context; readiness was published by the `swap`
             // above before any woken thread reloads it.
             unsafe { self.poll_set.wake(IoEvents::IN) };
@@ -215,11 +255,28 @@ pub(crate) fn refresh_fence_waiters_from_irq() {
     FENCE_WAITERS.lock().retain(|(_, w)| w.strong_count() > 0);
 }
 
-/// Task-context refresh of every live out-fence: pumps the used ring (via
-/// `fence_completed`) so `completed_fence_id` advances, then signals + wakes
-/// the pollers of fences that just completed. Called on the refresher's
-/// active (pollers present) service cadence.
-fn refresh_all_fences() {
+/// [wake-hop run7] Burst window after an execbuffer kick: the refresher
+/// re-pumps the used ring at 50µs cadence so a just-submitted fence signals
+/// within ~one host round-trip instead of waiting for the next 1ms tick.
+static REFRESHER_BURST_UNTIL_NS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+const REFRESHER_BURST_WINDOW_NS: u64 = 500_000;
+const REFRESHER_BURST_TICK: Duration = Duration::from_micros(50);
+
+/// Kicks the refresher into burst mode. Called (task context) right after an
+/// execbuffer submit that registered an out-fence; the host completes the
+/// fenced command ~tens of µs later, and burst pumping signals the fence as
+/// soon as that completion reaches the used ring.
+pub(crate) fn kick_refresher() {
+    REFRESHER_BURST_UNTIL_NS.store(
+        monotonic_time().as_nanos() as u64 + REFRESHER_BURST_WINDOW_NS,
+        Ordering::Relaxed,
+    );
+    REFRESHER_WAKE.notify_one();
+}
+
+/// Returns the number of fences that transitioned to signaled.
+fn refresh_all_fences() -> usize {
     // Snapshot under the registry lock, then refresh *outside* it: holding
     // the IRQ-save registry lock across `lock_display()` would deadlock on
     // smp=1 if the display lock were held by a preempted task (local IRQs
@@ -227,15 +284,21 @@ fn refresh_all_fences() {
     let snapshot: Vec<(u64, Weak<SyncFile>)> = {
         let waiters = FENCE_WAITERS.lock();
         if waiters.is_empty() {
-            return;
+            return 0;
         }
         waiters.clone()
     };
+    let mut signaled = 0;
     for (_, w) in &snapshot {
         if let Some(sf) = w.upgrade() {
+            let before = sf.signaled.load(Ordering::Acquire);
             sf.refresh();
+            if !before && sf.signaled.load(Ordering::Acquire) {
+                signaled += 1;
+            }
         }
     }
+    signaled
 }
 
 /// Removes dead entries (dropped `SyncFile`s) from the registry. This keeps
@@ -254,8 +317,21 @@ fn prune_dead_waiters() {
 fn refresher_loop() -> ! {
     loop {
         if FENCE_POLLERS.load(Ordering::Acquire) > 0 {
-            refresh_all_fences();
-            crate::task::sleep(Duration::from_millis(1));
+            let signaled = refresh_all_fences();
+            let now = monotonic_time().as_nanos() as u64;
+            let in_burst = now < REFRESHER_BURST_UNTIL_NS.load(Ordering::Relaxed);
+            if in_burst && signaled == 0 {
+                // A kicked submit's completion is imminent; re-check quickly
+                // so the fence signals within one host round-trip.
+                crate::task::sleep(REFRESHER_BURST_TICK);
+            } else {
+                if signaled > 0 {
+                    REFRESHER_BURST_UNTIL_NS.store(0, Ordering::Relaxed);
+                }
+                REFRESHER_WAKE.wait_timeout_until(Duration::from_millis(1), || {
+                    FENCE_POLLERS.load(Ordering::Acquire) == 0
+                });
+            }
         } else {
             prune_dead_waiters();
             REFRESHER_WAKE.wait_timeout_until(REFRESHER_IDLE_TICK, || {

@@ -43,6 +43,18 @@ pub use self::{
 pub fn last_peer_wake_ns() -> u64 {
     stream::LAST_PEER_WAKE_NS.load(core::sync::atomic::Ordering::Relaxed)
 }
+
+/// [wake-hop] sender-side publish+wake invocation cost (n, sum ns, max ns,
+/// µs histogram buckets on `stream::WAKE_PUB_EDGES_US`). Worktree forensics.
+pub fn wake_pub_stats() -> (u64, u64, u64, &'static [core::sync::atomic::AtomicU64; 11]) {
+    use core::sync::atomic::Ordering;
+    (
+        stream::WAKE_PUB_N.load(Ordering::Relaxed),
+        stream::WAKE_PUB_SUM_NS.load(Ordering::Relaxed),
+        stream::WAKE_PUB_MAX_NS.load(Ordering::Relaxed),
+        &stream::WAKE_PUB_BUCKETS,
+    )
+}
 use crate::{
     ConnectStatus, NetError, NetResult, RecvOptions, SendOptions, Shutdown, Socket, SocketAddrEx,
     SocketOps,

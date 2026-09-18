@@ -690,6 +690,102 @@ fn record_execb_gap() {
     EXECB_GAP_BUCKETS[idx].fetch_add(1, Ordering::Relaxed);
 }
 
+// ==== [card0:q-seg] run138-142-style phase timers (reset per perf_report window) ====
+// Splits the two per-frame GPU submits into the same segments the dev-base
+// campaign used, so the port base can be compared layer by layer:
+//   execb: dispatch → eb-read → valid → cmdbuf-load → bo-loop → attach →
+//          infence → submit → ffd → write → notify (PERF_EXECBUF = whole fn).
+//   atomic: dispatch → read → load → apply → present → flip-ev, plus a
+//          real/test total split (TEST_ONLY commits skip present/flip).
+//   flip:  push (event build + queue) vs wake (poll_rx.wake) inside
+//          queue_flip_event — the old flip-wake storm segment.
+// A segment timer started in the ioctl match arm guards the dispatch leg;
+// interleaving is a non-issue on smp=1 because neither handler yields.
+static EB_SEG_T0: AtomicU64 = AtomicU64::new(0);
+static AT_SEG_T0: AtomicU64 = AtomicU64::new(0);
+static EB_SEG: [PerfSlot; 11] = [
+    PerfSlot::new(),
+    PerfSlot::new(),
+    PerfSlot::new(),
+    PerfSlot::new(),
+    PerfSlot::new(),
+    PerfSlot::new(),
+    PerfSlot::new(),
+    PerfSlot::new(),
+    PerfSlot::new(),
+    PerfSlot::new(),
+    PerfSlot::new(),
+];
+const EB_SEG_NAMES: [&str; 11] = [
+    "eb:dispatch",
+    "eb:read",
+    "eb:valid",
+    "eb:cmdbuf",
+    "eb:boloop",
+    "eb:attach",
+    "eb:infence",
+    "eb:submit",
+    "eb:ffd",
+    "eb:write",
+    "eb:notify",
+];
+const EB_DISP: usize = 0;
+const EB_READ: usize = 1;
+const EB_VALID: usize = 2;
+const EB_CMDBUF: usize = 3;
+const EB_BOLOOP: usize = 4;
+const EB_ATTACH: usize = 5;
+const EB_INFENCE: usize = 6;
+const EB_SUBMIT: usize = 7;
+const EB_FFD: usize = 8;
+const EB_WRITE: usize = 9;
+const EB_NOTIFY: usize = 10;
+static AT_SEG: [PerfSlot; 6] = [
+    PerfSlot::new(),
+    PerfSlot::new(),
+    PerfSlot::new(),
+    PerfSlot::new(),
+    PerfSlot::new(),
+    PerfSlot::new(),
+];
+const AT_SEG_NAMES: [&str; 6] = [
+    "at:dispatch",
+    "at:read",
+    "at:load",
+    "at:apply",
+    "at:present",
+    "at:flip-ev",
+];
+const AT_DISP: usize = 0;
+const AT_READ: usize = 1;
+const AT_LOAD: usize = 2;
+const AT_APPLY: usize = 3;
+const AT_PRESENT: usize = 4;
+const AT_FLIP: usize = 5;
+static AT_REAL: PerfSlot = PerfSlot::new();
+static AT_TEST: PerfSlot = PerfSlot::new();
+static FLIP_PUSH: PerfSlot = PerfSlot::new();
+static FLIP_WAKE: PerfSlot = PerfSlot::new();
+
+/// Close segment `idx` with `now - t0` and return `now` as the next t0.
+fn seg_mark(slot: &'static PerfSlot, t0: u64) -> u64 {
+    let now = monotonic_time().as_nanos() as u64;
+    slot.add(core::time::Duration::from_nanos(now.saturating_sub(t0)));
+    now
+}
+
+/// Record the VFS-dispatch leg (match-arm t0 → handler entry) and return the
+/// handler-entry timestamp as the first in-handler t0. Guards against a stale
+/// T0 (first call stores 0; a parked-away arm could theoretically wrap).
+fn seg_mark_dispatch(slot: &'static PerfSlot, t0: &AtomicU64) -> u64 {
+    let now = monotonic_time().as_nanos() as u64;
+    let t0v = t0.load(Ordering::Relaxed);
+    if t0v != 0 && t0v <= now {
+        slot.add(core::time::Duration::from_nanos(now - t0v));
+    }
+    now
+}
+
 // ---- Step-0 #2 / #1-a forensic counters (reset per perf_report window) ----
 // EXECBUFFER fence-mode selection Mesa actually sends. Only *counts*; full
 // per-submit detail is in the first-CREATE_DETAIL_LIMIT create logs.
@@ -1019,6 +1115,120 @@ fn perf_report(card: &Card0) {
             pwl[4].load(Ordering::Relaxed),
             pwl[5].load(Ordering::Relaxed),
         );
+        // [wake-hop run5] same buckets split by return cause: READY delivered
+        // events (wake-driven), TIMEOUT returned zero (stale timestamp).
+        let pwr = &crate::syscall::POLL_WAKE_READY;
+        let pwt = &crate::syscall::POLL_WAKE_TIMEOUT;
+        warn!(
+            "  [card0:fx] poll-wake-ready us:<100={} 100-500={} 500-1000={} 1-2m={} 2-4m={} >4m={}",
+            pwr[0].load(Ordering::Relaxed),
+            pwr[1].load(Ordering::Relaxed),
+            pwr[2].load(Ordering::Relaxed),
+            pwr[3].load(Ordering::Relaxed),
+            pwr[4].load(Ordering::Relaxed),
+            pwr[5].load(Ordering::Relaxed),
+        );
+        warn!(
+            "  [card0:fx] poll-wake-timeout us:<100={} 100-500={} 500-1000={} 1-2m={} 2-4m={} >4m={}",
+            pwt[0].load(Ordering::Relaxed),
+            pwt[1].load(Ordering::Relaxed),
+            pwt[2].load(Ordering::Relaxed),
+            pwt[3].load(Ordering::Relaxed),
+            pwt[4].load(Ordering::Relaxed),
+            pwt[5].load(Ordering::Relaxed),
+        );
+    }
+    // ---- [wake-hop] wakeup delivery chain decomposition (worktree probe). ----
+    {
+        use ax_runtime::task::probe;
+        let fmt11 = |b: &[AtomicU64]| -> [u64; 11] {
+            let mut out = [0u64; 11];
+            for (dst, src) in out.iter_mut().zip(b.iter()) {
+                *dst = src.load(Ordering::Relaxed);
+            }
+            out
+        };
+        let (pub_n, pub_sum, pub_max, pub_b) = ax_net::unix::wake_pub_stats();
+        if pub_n > 0 {
+            let b = fmt11(pub_b);
+            warn!(
+                "  [card0:fx] wake-hop pub n={pub_n} avg={:.2}us max={:.2}us us:<1={} 1-2={} \
+                 2-5={} 5-10={} 10-25={} 25-50={} 50-100={} 100-250={} 250-500={} 0.5-1m={} >1m={}",
+                pub_sum as f64 / pub_n as f64 / 1000.0,
+                pub_max as f64 / 1000.0,
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10],
+            );
+        }
+        let enq_n = probe::WAKE_ENQ_N.load(Ordering::Relaxed);
+        let twake_n = probe::THREAD_WAKE_N.load(Ordering::Relaxed);
+        let resume_n = probe::THREAD_RESUME_N.load(Ordering::Relaxed);
+        let rdelay_n = probe::RESUME_DELAY_N.load(Ordering::Relaxed);
+        if rdelay_n > 0 {
+            let resume_sum = probe::RESUME_DELAY_SUM_NS.load(Ordering::Relaxed);
+            let resume_max = probe::RESUME_DELAY_MAX_NS.load(Ordering::Relaxed);
+            let b = fmt11(&probe::RESUME_DELAY_BUCKETS);
+            warn!(
+                "  [card0:fx] wake-hop os enq={enq_n} twake={twake_n} resume={resume_n} \
+                 park2run n={rdelay_n} avg={:.2}us max={:.2}us us:<5={} 5-10={} 10-25={} \
+                 25-50={} 50-100={} 100-250={} 250-500={} 0.5-1m={} 1-2m={} 2-4m={} >4m={}",
+                resume_sum as f64 / rdelay_n as f64 / 1000.0,
+                resume_max as f64 / 1000.0,
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10],
+            );
+        }
+        let e2p_n = probe::ENQ2PICK_N.load(Ordering::Relaxed);
+        if e2p_n > 0 {
+            let e2p_sum = probe::ENQ2PICK_SUM_NS.load(Ordering::Relaxed);
+            let e2p_max = probe::ENQ2PICK_MAX_NS.load(Ordering::Relaxed);
+            let b = fmt11(&probe::ENQ2PICK_BUCKETS);
+            warn!(
+                "  [card0:fx] wake-hop enq2pick n={e2p_n} of picks={} avg={:.2}us max={:.2}us \
+                 us:<5={} 5-10={} 10-25={} 25-50={} 50-100={} 100-250={} 250-500={} 0.5-1m={} \
+                 1-2m={} 2-4m={} >4m={}",
+                probe::PICK_N.load(Ordering::Relaxed),
+                e2p_sum as f64 / e2p_n as f64 / 1000.0,
+                e2p_max as f64 / 1000.0,
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10],
+            );
+        }
+        let poll_n = probe::POLL_DUR_N.load(Ordering::Relaxed);
+        if poll_n > 0 {
+            let poll_sum = probe::POLL_DUR_SUM_NS.load(Ordering::Relaxed);
+            let poll_max = probe::POLL_DUR_MAX_NS.load(Ordering::Relaxed);
+            let b = fmt11(&probe::POLL_DUR_BUCKETS);
+            warn!(
+                "  [card0:fx] wake-hop poll-dur n={poll_n} avg={:.2}us max={:.2}us us:<1={} 1-2={} \
+                 2-5={} 5-10={} 10-25={} 25-50={} 50-100={} 100-250={} 250-500={} 0.5-1m={} >1m={}",
+                poll_sum as f64 / poll_n as f64 / 1000.0,
+                poll_max as f64 / 1000.0,
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10],
+            );
+        }
+        let p2r_cnt = crate::syscall::PICK2RET_CNT.load(Ordering::Relaxed);
+        if p2r_cnt > 0 {
+            let p2r_sum = crate::syscall::PICK2RET_SUM_US.load(Ordering::Relaxed);
+            let b = fmt11(&crate::syscall::PICK2RET);
+            warn!(
+                "  [card0:fx] wake-hop pick2ret n={p2r_cnt} avg={:.2}us us:<5={} 5-10={} 10-25={} \
+                 25-50={} 50-100={} 100-250={} 250-500={} 0.5-1m={} 1-2m={} 2-4m={} >4m={}",
+                p2r_sum as f64 / p2r_cnt as f64,
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10],
+            );
+        }
+        // [wake-hop run6] out-fence latency (register → signal).
+        let fl_n = super::sync_file::FENCE_LAT_N.load(Ordering::Relaxed);
+        if fl_n > 0 {
+            let fl_sum = super::sync_file::FENCE_LAT_SUM_NS.load(Ordering::Relaxed);
+            let fl_max = super::sync_file::FENCE_LAT_MAX_NS.load(Ordering::Relaxed);
+            let b = fmt11(&super::sync_file::FENCE_LAT_BUCKETS);
+            warn!(
+                "  [card0:fx] fence-lat n={fl_n} avg={:.2}us max={:.2}us us:<10={} 10-25={} \
+                 25-50={} 50-100={} 100-250={} 250-500={} 0.5-1m={} 1-2m={} 2-4m={} 4-8m={} >8m={}",
+                fl_sum as f64 / fl_n as f64 / 1000.0,
+                fl_max as f64 / 1000.0,
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10],
+            );
+        }
     }
     if RING_DUMPED.load(Ordering::Relaxed) < RING_DUMP_LIMIT {
         let nonw = RING_LAST_EXECB_NONW.load(Ordering::Relaxed);
@@ -1097,6 +1307,38 @@ fn perf_report(card: &Card0) {
         );
     }
 
+    // [card0:q-seg] per-phase segment split (run138-142 methodology).
+    warn!("[card0:q-seg] execbuffer segments (window):");
+    for (name, slot) in EB_SEG_NAMES.iter().zip(EB_SEG.iter()) {
+        let c = slot.cnt.load(Ordering::Relaxed);
+        if c > 0 {
+            warn!(
+                "  [card0:q-seg]   {:<12} n={:>8} avg={:>8.2}us max={:>8.2}us",
+                name,
+                c,
+                slot.sum_ns.load(Ordering::Relaxed) as f64 / c as f64 / 1e3,
+                slot.max_ns.load(Ordering::Relaxed) as f64 / 1e3,
+            );
+        }
+    }
+    warn!("[card0:q-seg] atomic segments (window):");
+    for (name, slot) in AT_SEG_NAMES.iter().zip(AT_SEG.iter()) {
+        let c = slot.cnt.load(Ordering::Relaxed);
+        if c > 0 {
+            warn!(
+                "  [card0:q-seg]   {:<12} n={:>8} avg={:>8.2}us max={:>8.2}us",
+                name,
+                c,
+                slot.sum_ns.load(Ordering::Relaxed) as f64 / c as f64 / 1e3,
+                slot.max_ns.load(Ordering::Relaxed) as f64 / 1e3,
+            );
+        }
+    }
+    line!("at:real-total", AT_REAL);
+    line!("at:test-total", AT_TEST);
+    line!("flip:push", FLIP_PUSH);
+    line!("flip:wake", FLIP_WAKE);
+
     // Zero the counters so each report is its own window.
     let zero = |slot: &'static PerfSlot| {
         slot.cnt.store(0, Ordering::Relaxed);
@@ -1115,6 +1357,13 @@ fn perf_report(card: &Card0) {
     zero(&PERF_DUMMAP);
     zero(&PERF_DUMDESTROY);
     zero(&PERF_GEMCLOSE);
+    for s in EB_SEG.iter().chain(AT_SEG.iter()) {
+        zero(s);
+    }
+    zero(&AT_REAL);
+    zero(&AT_TEST);
+    zero(&FLIP_PUSH);
+    zero(&FLIP_WAKE);
     EXECB_FENCE_FD_IN.store(0, Ordering::Relaxed);
     EXECB_FENCE_FD_OUT.store(0, Ordering::Relaxed);
     EXECB_SYNC_IN.store(0, Ordering::Relaxed);
@@ -1153,6 +1402,63 @@ fn perf_report(card: &Card0) {
     DUMB_ALLOC_SUM.store(0, Ordering::Relaxed);
     DUMB_ZERO_SUM.store(0, Ordering::Relaxed);
     DUMB_ENQ_SUM.store(0, Ordering::Relaxed);
+    // [wake-hop] reset the wakeup-delivery probe stage counters.
+    {
+        use ax_runtime::task::probe;
+        let (_, _, _, pub_b) = ax_net::unix::wake_pub_stats();
+        for b in pub_b {
+            b.store(0, Ordering::Relaxed);
+        }
+        for slot in probe::WAKE_SLOT_VICTIM.iter().chain(probe::WAKE_SLOT_ENQ_NS.iter()).chain(probe::TW_SLOT_VICTIM.iter()).chain(probe::TW_SLOT_WAKE_NS.iter()) {
+            slot.store(0, Ordering::Relaxed);
+        }
+        for b in [
+            &probe::RESUME_DELAY_BUCKETS,
+            &probe::ENQ2PICK_BUCKETS,
+            &probe::POLL_DUR_BUCKETS,
+        ] {
+            for slot in b.iter() {
+                slot.store(0, Ordering::Relaxed);
+            }
+        }
+        for stat in [
+            &probe::WAKE_ENQ_N,
+            &probe::THREAD_WAKE_N,
+            &probe::THREAD_RESUME_N,
+            &probe::RESUME_DELAY_N,
+            &probe::RESUME_DELAY_SUM_NS,
+            &probe::RESUME_DELAY_MAX_NS,
+            &probe::PICK_N,
+            &probe::LAST_PICK_NS,
+            &probe::LAST_PICK_VICTIM,
+            &probe::ENQ2PICK_N,
+            &probe::ENQ2PICK_SUM_NS,
+            &probe::ENQ2PICK_MAX_NS,
+            &probe::POLL_DUR_N,
+            &probe::POLL_DUR_SUM_NS,
+            &probe::POLL_DUR_MAX_NS,
+        ] {
+            stat.store(0, Ordering::Relaxed);
+        }
+        for b in crate::syscall::PICK2RET.iter() {
+            b.store(0, Ordering::Relaxed);
+        }
+        crate::syscall::PICK2RET_CNT.store(0, Ordering::Relaxed);
+        crate::syscall::PICK2RET_SUM_US.store(0, Ordering::Relaxed);
+        // [wake-hop run6] fence latency probe reset.
+        super::sync_file::FENCE_LAT_N.store(0, Ordering::Relaxed);
+        super::sync_file::FENCE_LAT_SUM_NS.store(0, Ordering::Relaxed);
+        super::sync_file::FENCE_LAT_MAX_NS.store(0, Ordering::Relaxed);
+        for b in super::sync_file::FENCE_LAT_BUCKETS.iter() {
+            b.store(0, Ordering::Relaxed);
+        }
+        for b in crate::syscall::POLL_WAKE_READY
+            .iter()
+            .chain(crate::syscall::POLL_WAKE_TIMEOUT.iter())
+        {
+            b.store(0, Ordering::Relaxed);
+        }
+    }
     card.create_by_pid.lock().clear();
     card.wait_handles.lock().clear();
     card.rescreate_geoms.lock().clear();
@@ -1591,7 +1897,10 @@ impl DeviceOps for Card0 {
             DRM_IOCTL_MODE_PAGE_FLIP => self.handle_page_flip(current, arg),
             DRM_IOCTL_WAIT_VBLANK => self.handle_wait_vblank(current, arg),
 
-            DRM_IOCTL_MODE_ATOMIC => perf_measure(&PERF_ATOMIC, || self.handle_atomic(current, arg)),
+            DRM_IOCTL_MODE_ATOMIC => {
+                AT_SEG_T0.store(monotonic_time().as_nanos() as u64, Ordering::Relaxed);
+                perf_measure(&PERF_ATOMIC, || self.handle_atomic(current, arg))
+            }
             DRM_IOCTL_MODE_CREATEPROPBLOB => self.handle_create_blob(current, arg),
             DRM_IOCTL_MODE_DESTROYPROPBLOB => self.handle_destroy_blob(current, arg),
             DRM_IOCTL_MODE_GETPROPBLOB => self.handle_get_blob(current, arg),
@@ -1612,6 +1921,7 @@ impl DeviceOps for Card0 {
             DRM_IOCTL_VIRTGPU_RESOURCE_INFO => self.handle_virtgpu_resource_info(current, arg),
             DRM_IOCTL_VIRTGPU_MAP => self.handle_virtgpu_map(current, arg),
             DRM_IOCTL_VIRTGPU_EXECBUFFER => {
+                EB_SEG_T0.store(monotonic_time().as_nanos() as u64, Ordering::Relaxed);
                 record_execb_gap();
                 // Ring marker: the last ring entry written is this EXECBUFFER —
                 // perf_report dumps the ioctl sequence between two submits.
@@ -3016,6 +3326,7 @@ impl Card0 {
     /// Enqueue a `drm_event_vblank` for the next `read()`, wake pollers.
     /// Shared by legacy PAGE_FLIP and atomic commits.
     fn queue_flip_event(&self, user_data: u64) {
+        let ft0 = monotonic_time().as_nanos() as u64;
         let seq = self
             .sequence
             .fetch_add(1, Ordering::Relaxed)
@@ -3041,9 +3352,11 @@ impl Card0 {
                 true
             }
         };
+        let ft1 = seg_mark(&FLIP_PUSH, ft0);
         if enqueued {
             // DRM event is queued before waking readers.
             unsafe { self.poll_rx.wake(IoEvents::IN) };
+            seg_mark(&FLIP_WAKE, ft1);
         }
     }
 
@@ -3093,8 +3406,11 @@ impl Card0 {
     // ======== M4c: atomic commit + blob properties ========
 
     fn handle_atomic(&self, current: &crate::task::UserTaskRef, arg: usize) -> VfsResult<usize> {
+        let at_entry = seg_mark_dispatch(&AT_SEG[AT_DISP], &AT_SEG_T0);
+        let mut seg_t = at_entry;
         let ptr = arg as *const DrmModeAtomic;
         let a: DrmModeAtomic = ptr.vm_read(current).map_err(|_| VfsError::BadAddress)?;
+        seg_t = seg_mark(&AT_SEG[AT_READ], seg_t);
 
         let known = DRM_MODE_ATOMIC_TEST_ONLY
             | DRM_MODE_ATOMIC_NONBLOCK
@@ -3114,6 +3430,7 @@ impl Card0 {
             .map_err(|_| VfsError::BadAddress)?;
         let values: Vec<u64> = vm_load(current, a.prop_values_ptr as *const u64, total_props)
             .map_err(|_| VfsError::BadAddress)?;
+        seg_t = seg_mark(&AT_SEG[AT_LOAD], seg_t);
 
         let mut state = self.state.lock();
         let mut proposed = *state;
@@ -3142,8 +3459,12 @@ impl Card0 {
                 }
             }
         }
+        seg_t = seg_mark(&AT_SEG[AT_APPLY], seg_t);
 
         if a.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0 {
+            AT_TEST.add(core::time::Duration::from_nanos(
+                monotonic_time().as_nanos() as u64 - at_entry,
+            ));
             return Ok(0);
         }
 
@@ -3155,11 +3476,17 @@ impl Card0 {
         }
         if current_fb != 0 {
             self.present_fb(current_fb);
+            seg_t = seg_mark(&AT_SEG[AT_PRESENT], seg_t);
             perf_report(self);
         }
         if a.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
             self.queue_flip_event(a.user_data);
+            seg_t = seg_mark(&AT_SEG[AT_FLIP], seg_t);
         }
+        AT_REAL.add(core::time::Duration::from_nanos(
+            monotonic_time().as_nanos() as u64 - at_entry,
+        ));
+        let _ = seg_t;
         Ok(0)
     }
 
@@ -3880,9 +4207,11 @@ impl Card0 {
         &self,
         current: &crate::task::UserTaskRef,
         arg: usize) -> VfsResult<usize> {
+        let mut seg_t = seg_mark_dispatch(&EB_SEG[EB_DISP], &EB_SEG_T0);
         let mut eb: DrmVirtgpuExecbuffer = (arg as *const DrmVirtgpuExecbuffer)
             .vm_read(current)
             .map_err(|_| VfsError::BadAddress)?;
+        seg_t = seg_mark(&EB_SEG[EB_READ], seg_t);
 
         // ---- Step-0 #1-a forensic: which fence mode does Mesa select?
         // (legacy fence-fd vs modern syncobj vs none). Per-window totals and
@@ -3939,6 +4268,7 @@ impl Card0 {
         } else {
             None
         };
+        seg_t = seg_mark(&EB_SEG[EB_VALID], seg_t);
 
         // Validate bo_handles array.
         if eb.num_bo_handles > 256 {
@@ -3951,6 +4281,7 @@ impl Card0 {
         } else {
             Vec::new()
         };
+        seg_t = seg_mark(&EB_SEG[EB_CMDBUF], seg_t);
 
         // Read and validate bo_handles array from userspace.
         // Each handle is a u32, stored at a u64 pointer.
@@ -3967,6 +4298,7 @@ impl Card0 {
                     .map_err(|_| VfsError::BadAddress)?;
             }
             submit_bo_handles.extend_from_slice(&handles);
+            seg_t = seg_mark(&EB_SEG[EB_BOLOOP], seg_t);
 
             // Attach resources to this context on first use only. Linux does
             // this once per GEM open (`virtio_gpu_gem_object_open` →
@@ -4005,6 +4337,7 @@ impl Card0 {
                     res.attached_ctxs.insert(ctx_id);
                 }
             }
+            seg_t = seg_mark(&EB_SEG[EB_ATTACH], seg_t);
         }
 
         // Enforce the in-fence dependency: the batch must not reach the host
@@ -4017,6 +4350,7 @@ impl Card0 {
             // dependency into a silently unordered submit.
             return Err(VfsError::InvalidInput);
         }
+        seg_t = seg_mark(&EB_SEG[EB_INFENCE], seg_t);
         // Submit the command buffer to the host.
         let mut out_fence_fd: i32 = -1;
         if ax_display::has_virgl() {
@@ -4032,6 +4366,7 @@ impl Card0 {
                 *e = (*e).max(fence_id);
             }
             drop(bo_fence);
+            seg_t = seg_mark(&EB_SEG[EB_SUBMIT], seg_t);
 
             // Linux: `VIRTGPU_EXECBUF_FENCE_FD_OUT` wraps the submit fence in
             // a sync_file and returns the fd (`virtgpu_execbuffer_ioctl`). The
@@ -4044,16 +4379,26 @@ impl Card0 {
                 sync_file.register();
                 out_fence_fd = add_file_like(sync_file, true).map_err(|_| VfsError::NoMemory)?;
             }
+            seg_t = seg_mark(&EB_SEG[EB_FFD], seg_t);
         }
         eb.fence_fd = out_fence_fd;
         (arg as *mut DrmVirtgpuExecbuffer)
             .vm_write(current, eb)
             .map_err(|_| VfsError::BadAddress)?;
+        seg_t = seg_mark(&EB_SEG[EB_WRITE], seg_t);
 
         // EXECBUFFER is a fire-and-forget transaction (optional ctx_attach +
         // submit_3d); one boundary notify delivers it — Linux
         // `virtio_gpu_notify()`.
         ax_display::gpu3d_ctrl_notify();
+        seg_mark(&EB_SEG[EB_NOTIFY], seg_t);
+
+        // [wake-hop run7] The out-fence (when FENCE_FD_OUT) completes tens of
+        // µs from now; kick the refresher into burst pumping so the fence
+        // signals within one host round-trip instead of the next 1ms tick.
+        if (eb.flags & VIRTGPU_EXECBUF_FENCE_FD_OUT) != 0 {
+            super::sync_file::kick_refresher();
+        }
 
         Ok(0)
     }

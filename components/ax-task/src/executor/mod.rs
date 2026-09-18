@@ -162,6 +162,9 @@ impl LocalExecutor {
             let condition = ExecutorParkCondition { executor: self };
             park(&condition);
             let _owner_work = token.finish();
+            // [wake-hop] stage 3: back on CPU after the OS park; the delay to
+            // this thread's last issued thread wake is the scheduler pickup.
+            crate::probe::record_thread_resume(self.owner_thread().as_u64());
             unsafe {
                 // Returning from the OS park path is also a reason to recheck a
                 // root future for signal or non-executor readiness changes.
@@ -464,6 +467,9 @@ impl SharedExecutor {
     fn notify_owner(&self, intent: crate::thread::WakeIntent) {
         let previous = self.park_state.fetch_or(NOTIFIED, Ordering::AcqRel);
         if previous & PARKED != 0 {
+            // [wake-hop] stage 2: the owner is parked, so delivery now costs an
+            // OS scheduler wakeup on top of the ready-inbox publication.
+            crate::probe::record_thread_wake(self.owner_thread.as_u64());
             let _result = if intent.is_sync() {
                 self.owner_wake.wake_sync()
             } else {
