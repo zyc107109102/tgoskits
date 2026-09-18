@@ -493,7 +493,7 @@ name = "arceos-vcpu-perf"
 version = "0.1.0"
 dependencies = [
  "ax-std",
- "toml 1.1.4+spec-1.1.0",
+ "toml 1.1.6+spec-1.1.0",
 ]
 
 [[package]]
@@ -865,6 +865,7 @@ dependencies = [
 name = "ax-display"
 version = "0.6.11"
 dependencies = [
+ "ax-hal",
  "ax-lazyinit",
  "ax-task",
  "irq-framework",
@@ -9183,8 +9184,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "virtio-drivers"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfdc1c628cdd8ce7c3b9e65a8ed550d0338e9ef9f911e729666f1cce097de2f7"
 dependencies = [
  "bitflags 2.13.2",
  "enumn",

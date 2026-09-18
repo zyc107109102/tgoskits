@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 use core::{
     mem::{MaybeUninit, offset_of},
+    sync::atomic::{AtomicU64, Ordering},
     task::Poll,
 };
 
@@ -139,25 +140,63 @@ fn do_poll(
     }
 
     with_blocked_signals(sigmask, || {
+        // [run6g] set when the first readiness check found nothing: from then
+        // on this poll has registered a waker, so its wake-to-return delta is
+        // meaningful.
+        let did_wait = core::cell::Cell::new(false);
         let wait = poll_shared(
             || {
                 let res = collect_ready_poll_events(&fds, &revent_indices, poll_fds);
                 if res > 0 {
                     return Poll::Ready(Ok(res as _));
                 }
+                did_wait.set(true);
                 Poll::Pending
             },
             |registrar| unsafe { fds.register_shared(registrar, IoEvents::empty()) },
         );
 
         let task = current;
-        match block_on_user_timeout(task, timeout, wait) {
+        let out = match block_on_user_timeout(task, timeout, wait) {
             UserWaitOutcome::Ready(result) => result,
             UserWaitOutcome::TimedOut => Ok(0),
             UserWaitOutcome::Interrupted => Err(crate::StarryError::Interrupted),
+        };
+        // [run6g] poll wake-to-return latency: the last unix-stream send that
+        // woke this poller happened at LAST_PEER_WAKE_NS; the delta to now is
+        // the wakeup+return path cost (waker -> scheduler -> re-poll -> syscall
+        // return). Only counted when this poll actually waited (registered a
+        // waker); an instantly-ready poll's delta is meaningless.
+        if did_wait.get() && out.is_ok() {
+            let now_ns = ax_runtime::hal::time::monotonic_time_nanos() as u64;
+            let last_wake = crate::syscall::net::unix_stream_last_peer_wake_ns();
+            let lat_us = now_ns.saturating_sub(last_wake) / 1000;
+            let idx = match lat_us {
+                x if x < 100 => 0,
+                x if x < 500 => 1,
+                x if x < 1000 => 2,
+                x if x < 2000 => 3,
+                x if x < 4000 => 4,
+                _ => 5,
+            };
+            POLL_WAKE_LAT[idx].fetch_add(1, Ordering::Relaxed);
+            POLL_WAKE_LAT_CNT.fetch_add(1, Ordering::Relaxed);
         }
+        out
     })
 }
+
+/// [run6g] wake-to-return latency buckets (µs): <100, 100-500, 500-1000,
+/// 1-2ms, 2-4ms, >4ms. Read/reset by the card0 fx report.
+pub static POLL_WAKE_LAT: [AtomicU64; 6] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+pub static POLL_WAKE_LAT_CNT: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_poll(
